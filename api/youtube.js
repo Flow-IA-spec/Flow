@@ -1,102 +1,88 @@
-// Resume vídeo do YouTube extraindo legendas do ytInitialPlayerResponse
+// Resumo de YouTube via Invidious API (open-source, sem chave)
+const INSTANCES = [
+  'https://inv.nadeko.net',
+  'https://invidious.privacydev.net',
+  'https://yt.cdaut.de',
+  'https://invidious.slipfox.xyz',
+  'https://invidious.io',
+];
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).end();
   const { url } = req.body || {};
   const videoId = url?.match(/(?:v=|youtu\.be\/|shorts\/)([a-zA-Z0-9_-]{11})/)?.[1];
   if (!videoId) return res.status(400).json({ error: 'URL do YouTube inválida' });
 
-  try {
-    // Busca a página do YouTube
-    const pageResp = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Cookie': 'CONSENT=YES+cb.20230101-07-p0.pt+FX+901; SOCS=CAE=',
-      },
-    });
-
-    if (!pageResp.ok) throw new Error('HTTP ' + pageResp.status);
-    const html = await pageResp.text();
-
-    // Extrai título
-    let title = videoId;
+  // Tenta cada instância do Invidious
+  for (const base of INSTANCES) {
     try {
-      const tm = html.match(/"title":"((?:[^"\\]|\\.)*)"/);
-      if (tm) title = tm[1].replace(/\\n/g, ' ').replace(/\\"/g, '"').replace(/\\\\/g, '\\').slice(0, 120);
-    } catch {}
+      const r = await fetchT(`${base}/api/v1/videos/${videoId}?fields=title,captions,description`, 6000);
+      if (!r?.ok) continue;
+      const data = await r.json();
+      if (!data || data.error) continue;
 
-    // Extrai ytInitialPlayerResponse
-    let playerData = null;
-    const patterns = [
-      /ytInitialPlayerResponse\s*=\s*({.+?})\s*;(?:\s*(?:var|const|let)\s+\w|\s*<\/script>)/s,
-      /ytInitialPlayerResponse\s*=\s*({.+?})\s*;/s,
-    ];
-    for (const pat of patterns) {
-      const m = html.match(pat);
-      if (m) {
-        try { playerData = JSON.parse(m[1]); break; } catch {}
+      const title = data.title || videoId;
+
+      // Procura legenda em PT ou EN
+      const captions = data.captions || [];
+      const langs = ['pt','pt-BR','Portuguese','en','English'];
+      let cap = null;
+      for (const l of langs) {
+        cap = captions.find(c => c.languageCode?.startsWith(l.split('-')[0]) || c.label?.toLowerCase().includes(l.toLowerCase()));
+        if (cap) break;
       }
-    }
+      if (!cap && captions.length) cap = captions[0];
 
-    // Pega caption tracks do playerData
-    const captionTracks = playerData?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
-
-    if (captionTracks.length > 0) {
-      // Prioriza PT depois EN depois qualquer outra
-      const langs = ['pt', 'pt-BR', 'pt-PT', 'en', 'en-US'];
-      let track = null;
-      for (const lang of langs) {
-        track = captionTracks.find(t => t.languageCode === lang || t.languageCode?.startsWith(lang.split('-')[0]));
-        if (track) break;
-      }
-      if (!track) track = captionTracks[0];
-
-      try {
-        const captUrl = track.baseUrl + '&fmt=srv3';
-        const captResp = await fetch(captUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-        if (captResp.ok) {
-          const xml = await captResp.text();
-          if (xml.includes('<text')) {
-            const transcript = xml
-              .replace(/<[^>]+>/g, ' ')
-              .replace(/&amp;/g, '&').replace(/&#39;/g, "'").replace(/&quot;/g, '"')
-              .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#10;/g, ' ')
-              .replace(/\s+/g, ' ').trim();
-
+      if (cap) {
+        try {
+          const captUrl = cap.url?.startsWith('http') ? cap.url : `${base}${cap.url}`;
+          const cr = await fetchT(captUrl, 5000);
+          if (cr?.ok) {
+            const txt = await cr.text();
+            const transcript = txt
+              .replace(/<[^>]+>/g,' ')
+              .replace(/&amp;/g,'&').replace(/&#39;/g,"'").replace(/&quot;/g,'"').replace(/&lt;/g,'<').replace(/&gt;/g,'>')
+              .replace(/\d{2}:\d{2}:\d{2}[\.,]\d{3}/g,'')
+              .replace(/^WEBVTT.*/m,'')
+              .replace(/\s+/g,' ').trim();
             if (transcript.length > 80) {
-              return res.json({ title, transcript: transcript.slice(0, 9000), type: 'transcript', lang: track.languageCode });
+              return res.json({ title, transcript: transcript.slice(0, 9000), type: 'transcript' });
             }
           }
-        }
-      } catch {}
-    }
+        } catch {}
+      }
 
-    // Fallback: descrição do vídeo
-    const desc = playerData?.videoDetails?.shortDescription;
-    if (desc && desc.length > 20) {
-      return res.json({ title, transcript: desc.slice(0, 5000), type: 'description' });
-    }
-
-    // Fallback: tentar timedtext legado
-    for (const lang of ['pt', 'pt-BR', 'en']) {
-      try {
-        const r = await fetch(`https://www.youtube.com/api/timedtext?lang=${lang}&v=${videoId}&fmt=srv3`);
-        if (r.ok) {
-          const xml = await r.text();
-          if (xml.includes('<text')) {
-            const t = xml.replace(/<[^>]+>/g, ' ').replace(/&amp;/g, '&').replace(/&#39;/g, "'").replace(/\s+/g, ' ').trim();
-            if (t.length > 80) return res.json({ title, transcript: t.slice(0, 9000), type: 'transcript' });
-          }
-        }
-      } catch {}
-    }
-
-    res.status(404).json({
-      error: 'Vídeo sem legendas detectáveis. Tente um vídeo com legendas automáticas ativadas, ou que tenha descrição longa.'
-    });
-
-  } catch (e) {
-    res.status(500).json({ error: 'Erro ao processar: ' + e.message });
+      // Fallback: usa descrição do vídeo
+      const desc = data.description || '';
+      if (desc.length > 50) {
+        return res.json({ title, transcript: desc.slice(0, 5000), type: 'description' });
+      }
+    } catch {}
   }
+
+  // Último recurso: página do YouTube com regex
+  try {
+    const pr = await fetchT(`https://www.youtube.com/watch?v=${videoId}`, 8000, {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124',
+      'Accept-Language': 'pt-BR,pt;q=0.9',
+      'Cookie': 'CONSENT=YES+cb; SOCS=CAE=',
+    });
+    if (pr?.ok) {
+      const html = await pr.text();
+      const title = html.match(/"title":"((?:[^"\\]|\\.)*)"/)?.[1]?.replace(/\\./g, m => m === '\\n' ? ' ' : m.slice(1)) || videoId;
+      const desc = html.match(/"shortDescription":"((?:[^"\\]|\\.)*)"/)?.[1]?.replace(/\\n/g,'\n').replace(/\\"/g,'"').replace(/\\\\/g,'\\') || '';
+      if (desc.length > 50) return res.json({ title, transcript: desc.slice(0, 5000), type: 'description' });
+    }
+  } catch {}
+
+  res.status(404).json({ error: 'Não foi possível obter legendas ou descrição deste vídeo. Tente outro vídeo.' });
+}
+
+function fetchT(url, ms, extraHeaders = {}) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error('timeout')), ms);
+    fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0', ...extraHeaders } })
+      .then(r => { clearTimeout(t); resolve(r); })
+      .catch(e => { clearTimeout(t); reject(e); });
+  });
 }
